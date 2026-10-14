@@ -155,7 +155,7 @@ Some dirs (e.g. `/npx`, `/npx/user`) report `rctime = 4294967295` forever. A des
   - Those dirs are stored in `state.py`, reported once per run on stderr (`WARNING: rctime pinned to 2106-02-07 by an entry in /npx/user/bob/x`), and listed in the `run_end` record.
   - Chains are re-traced only on rediscovery or when the cached endpoint's stats change.
   - **Finding from a live trace (2026-10-14)** on `/mnt/ceph1/npx`:
-    - 23 chains were found, ending at e.g. `npx/user/mjeong` (rctime `2147483648`, i.e. 2³¹) and `npx/user/bbenkel/lib` (`4294967291`).
+    - 23 chains were found, ending at e.g. `npx/user/<user-a>` (rctime `2147483648`, i.e. 2³¹) and `npx/user/<user-b>/lib` (`4294967291`).
     - At **every** endpoint, no entry has a future ctime now. The entry that set the value was removed or moved, and the value stays because rctime never decreases.
     - So "culprit" reporting is mostly "stale". `rctime_effective` (children plus own times) is the workaround that matters.
 - **Raw values are kept.** The raw `rctime` is always stored unchanged next to the flag and the derived value. The tool never "corrects" rctime silently.

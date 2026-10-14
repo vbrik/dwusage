@@ -2114,7 +2114,7 @@ This task needs the live mounts (`/mnt/ceph1`, `/mnt/ceph2`, both mounted read-o
 - [ ] **Step 1: Smoke-test on a small live tree**
 
 ```bash
-S=/tmp/claude-1000/-home-vbrik-proj-datawarehouse-usage-tracker/ab1a298b-79ba-4788-a377-4e2b58fe3dc9/scratchpad
+S="${TMPDIR:-/tmp}/dwusage-m1"; mkdir -p "$S"
 time PYTHONPATH=src python3 -m dwusage capture /mnt/ceph1/volumes --depth 1 -o $S/volumes.jsonl.gz
 zcat $S/volumes.jsonl.gz | jq -c 'select(.type=="capture_end")'
 zcat $S/volumes.jsonl.gz | jq -r 'select(.type=="dir" and .errors!={}) | [.path, (.errors|tostring)] | @tsv'
