@@ -17,6 +17,7 @@ from dwusage.capture import CaptureLimits, Capturer, CaptureResult, ChainEnd, ch
 from dwusage.capture_file import Output, capture_lines
 from dwusage.fs.base import describe_oserror
 from dwusage.fs.ceph import CephFs
+from dwusage.paths import printable
 
 DEFAULT_WORKERS: Final = 16
 """Parallel filesystem operations; enough to hide MDS latency without flooding it."""
@@ -133,7 +134,7 @@ def _chain_summary(result: CaptureResult, output: str) -> str | None:
         entry = result.records[path].files.future[0]
         which = "mtime" if entry.stat.mtime_ns >= entry.stat.ctime_ns else "ctime"
         newest = max(entry.stat.mtime_ns, entry.stat.ctime_ns) / 1e9
-        culprit = path if entry.name == "." else os.path.join(path, entry.name)
+        culprit = printable(path if entry.name == "." else os.path.join(path, entry.name))
         parts.append(
             f"{n} end at entries with a future mtime or ctime "
             f"(e.g. {culprit}, {which} {_date(newest)})"
@@ -141,7 +142,10 @@ def _chain_summary(result: CaptureResult, output: str) -> str | None:
     if n := counts[ChainEnd.STALE]:
         parts.append(f"{n} are stale (that entry was changed or removed; rctime never decreases)")
     if n := counts[ChainEnd.UNDETERMINED]:
-        parts.append(f"{n} are undetermined (unreadable or vanished subdirs; run as root)")
+        parts.append(
+            f"{n} are undetermined (not listed, an unreadable or vanished subdir, "
+            "or a file scan cut short)"
+        )
     query = "jq -c 'select(.type==\"capture_end\").chain_ends'"
     if output != "-":
         query = f"{'zcat' if output.endswith('.gz') else 'cat'} {output} | {query}"
@@ -169,6 +173,13 @@ def capture_summary(
         lines.append(
             f"WARNING: --chain-max-dirs reached under {', '.join(result.chain_truncated_roots)}; "
             "some pinned-rctime chains were not followed to the end."
+        )
+    if result.oversized:
+        n = sum(result.oversized.values())
+        lines.append(
+            f"WARNING: --max-list-entries kept {n} dir{'s' * (n != 1)} under "
+            f"{', '.join(result.oversized)} from being listed; their subdirs are missing. "
+            "Raise --max-list-entries."
         )
     if not openat2:
         lines.append(
@@ -228,7 +239,8 @@ def run_capture(args: argparse.Namespace) -> int:
             pool.shutdown(wait=False, cancel_futures=True)
     for line in capture_summary(result, n_roots=len(roots), output=args.output, openat2=fs.openat2):
         print(line, file=sys.stderr)
-    return EXIT_INCOMPLETE if result.truncated_roots or result.chain_truncated_roots else 0
+    limited = result.truncated_roots or result.chain_truncated_roots or result.oversized
+    return EXIT_INCOMPLETE if limited else 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:

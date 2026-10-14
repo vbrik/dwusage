@@ -49,3 +49,11 @@ def test_failures_mimic_cephfs():
         fs.inspect("/r/missing", [])
     failure = FakeFs(ceph=False).inspect("/", ["ceph.dir.rbytes"]).xattr_failure
     assert failure[0] == "ceph.dir.rbytes" and "not supported" in str(failure[1])
+
+
+def test_nondirs_not_stated_are_reported_as_truncated():
+    fs = FakeFs()
+    fs.mkfile("/r/f")
+    fs.mkdir("/r/d")
+    assert fs.listdir("/r").nondirs_truncated
+    assert not fs.listdir("/r/d").nondirs_truncated

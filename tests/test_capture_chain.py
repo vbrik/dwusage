@@ -79,7 +79,7 @@ def test_chain_budget_stops_following_and_says_so():
     result = capture(make_pinned_tree(), ["/r"], depth=0, chain_max_dirs=3)
     assert result.chain_truncated_roots == ("/r",)
     assert result.records["/r/a"].skipped == "chain_max_dirs"
-    assert result.chain_ends == {}
+    assert result.chain_ends == {"/r/a": ChainEnd.UNDETERMINED}
     assert "/r/a/b" not in result.records
 
 
@@ -108,3 +108,38 @@ def test_malformed_rctime_is_an_error_not_healthy():
     result = capture(OddFs(), ["/r"], depth=0)
     assert result.records["/r/odd"].errors == {"rctime": "malformed: 'garbage'"}
     assert result.chain_ends == {"/r": ChainEnd.UNDETERMINED}
+
+
+def test_no_file_scan_is_undetermined_not_stale():
+    fs = FakeFs()
+    fs.mkdir("/r", rctime=PINNED)
+    fs.mkfile("/r/bad", mtime=PINNED)
+    result = capture(fs, ["/r"], depth=0, pinned_max_files=0)
+    assert result.records["/r"].files.truncated
+    assert result.chain_ends == {"/r": ChainEnd.UNDETERMINED}
+
+
+def test_pinned_dir_too_big_to_list_is_an_undetermined_end():
+    fs = FakeFs()
+    fs.mkdir("/r", rctime=PINNED)
+    fs.mkdir("/r/big", rctime=PINNED)
+    for i in range(3):
+        fs.mkfile(f"/r/big/f{i}")
+    result = capture(fs, ["/r"], depth=0, max_list_entries=2)
+    assert result.records["/r/big"].skipped == "max_list_entries"
+    assert result.chain_ends == {"/r/big": ChainEnd.UNDETERMINED}
+
+
+def test_pinned_dir_that_fails_to_list_is_an_undetermined_end():
+    class GoneFs(FakeFs):
+        def listdir(self, path, stat_nondirs=0):
+            if path == "/r/gone":
+                raise FileNotFoundError(2, "No such file or directory", path)
+            return super().listdir(path, stat_nondirs)
+
+    fs = GoneFs()
+    fs.mkdir("/r", rctime=PINNED)
+    fs.mkdir("/r/gone", rctime=PINNED)
+    result = capture(fs, ["/r"], depth=0)
+    assert "list" in result.records["/r/gone"].errors
+    assert result.chain_ends == {"/r/gone": ChainEnd.UNDETERMINED}

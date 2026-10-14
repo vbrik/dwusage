@@ -119,6 +119,7 @@ def test_huge_dirs_are_not_listed():
     result = capture(fs, ["/r"], depth=3, max_list_entries=3)
     big = result.records["/r/big"]
     assert (big.subdirs, big.skipped) == (None, "max_list_entries")
+    assert result.oversized == {"/r": 1}
     assert "/r/big" not in fs.listed
 
 

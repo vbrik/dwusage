@@ -4,6 +4,7 @@ import stat
 
 import pytest
 
+from dwusage.fs import syscalls
 from dwusage.fs.base import describe_oserror
 from dwusage.fs.ceph import CephFs
 
@@ -101,3 +102,53 @@ def test_describe_oserror():
     exc = PermissionError(errno.EACCES, os.strerror(errno.EACCES), "/x")
     assert describe_oserror(exc) == "EACCES: Permission denied"
     assert describe_oserror(OSError("no errno")) == "OSError: no errno"
+
+
+def test_nondirs_not_stated_are_reported_as_truncated(tree):
+    with CephFs([str(tree)]) as fs:
+        assert fs.listdir(str(tree)).nondirs_truncated
+        assert not fs.listdir(str(tree / "d1")).nondirs_truncated  # no non-directories
+
+
+def _missing_openat2(*args: object) -> int:
+    raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
+
+
+def test_openat2_is_probed_at_the_root_and_a_later_eperm_is_a_per_dir_error(tree, monkeypatch):
+    real = syscalls.openat2
+
+    def flaky(dir_fd, path, flags, resolve):
+        if path == "d2":
+            raise PermissionError(errno.EPERM, os.strerror(errno.EPERM), path)
+        return real(dir_fd, path, flags, resolve)
+
+    monkeypatch.setattr(syscalls, "openat2", flaky)
+    with CephFs([str(tree)]) as fs:
+        fs.inspect(str(tree), [])
+        if not fs.openat2:
+            pytest.skip("kernel lacks openat2")
+        with pytest.raises(PermissionError):
+            fs.inspect(str(tree / "d2"), [])
+        assert fs.openat2
+        with pytest.raises(OSError, match="symlink, not followed"):
+            fs.inspect(str(tree / "link" / "x"), [])
+
+
+def test_without_openat2_a_final_symlink_is_still_refused(tree, monkeypatch):
+    monkeypatch.setattr(syscalls, "openat2", _missing_openat2)
+    with CephFs([str(tree)]) as fs:
+        assert stat.S_ISDIR(fs.inspect(str(tree / "d1"), []).stat.mode)
+        assert not fs.openat2
+        with pytest.raises(OSError) as exc:
+            fs.inspect(str(tree / "link"), [])
+    assert describe_oserror(exc.value) == "ELOOP: symlink, not followed"
+
+
+def test_without_openat2_other_filesystems_are_refused(tree, monkeypatch):
+    monkeypatch.setattr(syscalls, "openat2", _missing_openat2)
+    with CephFs([str(tree)]) as fs:
+        fs.inspect(str(tree), [])
+        fd, dev = fs._anchors[str(tree)]
+        fs._anchors[str(tree)] = (fd, dev + 1)  # as if each subdir were another mount
+        with pytest.raises(OSError, match="other filesystem"):
+            fs.inspect(str(tree / "d1"), [])

@@ -85,7 +85,7 @@ class FakeFs:
             for name, child in entry.children.items()
             if child.kind != "dir"
         ]
-        return Listing(subdirs, others[:stat_nondirs], len(others) > stat_nondirs > 0)
+        return Listing(subdirs, others[:stat_nondirs], len(others) > stat_nondirs)
 
     def _put(self, path: str, kind: str, attrs: dict) -> None:
         *parents, name = [part for part in path.split("/") if part]

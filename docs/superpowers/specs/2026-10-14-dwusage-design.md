@@ -88,8 +88,10 @@ tests/  deploy/compose.yaml  docs/terms.md  docs/conventions.md  README.md
 - **No symlinks, no other mounts.** `CephFs` opens every dir relative to its root with openat2 `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV` and reads only through that fd.
   - A dir that a user swaps for a symlink, at any path component and at any moment, is refused (`ELOOP`), and is recorded as an error.
   - Other mounts are not entered (`EXDEV`).
-  - This needs Linux 5.6 or later. Without openat2 (an older kernel, or a seccomp filter), `CephFs` opens with `O_NOFOLLOW` plus a same-device check and warns once that swaps in *intermediate* components go undetected.
+  - This needs Linux 5.6 or later. Whether openat2 works is probed once per root, before any user-controlled path, so an error on some directory never switches modes. Without openat2 (an older kernel, or a seccomp filter), `CephFs` opens with `O_NOFOLLOW` plus a same-device check and warns once that swaps in *intermediate* components go undetected.
 - **Outputs are private.** Capture files, JSONL files and SQLite databases are created with mode 0600 under a temporary name, then renamed. They reveal names and sizes of dirs other users can't read. Access to PostgreSQL is controlled by the database.
+  - An empty output path, or an existing destination that isn't a regular file, is refused before any work: renaming over `/dev/null` as root would replace the device.
+- **Messages are inert.** Names from the filesystem are escaped (`paths.printable`) before they appear in messages, so they can't control the terminal or forge `ERROR:` lines in logs.
 - **Secrets stay out of config and the command line.** PostgreSQL credentials come from a libpq service file, `.pgpass` or `PGPASSFILE`. DSNs are redacted in messages and in the `runs` table.
 - **No identifiers in the repo.** Committed files carry no real names. Captures are git-ignored, and fixtures are anonymized consistently (M2).
 
@@ -254,7 +256,8 @@ dwusage db load --sink SPEC FILE...
 - **Deciding vs printing.** Each command calls a library function that returns a typed result (`Capturer.run`, `plan_trees`, `run_sample`); `cli.py` only parses and renders.
 - **`capture`** needs no config; Milestone 1 implements it.
   - Dirs within `--depth` are listed.
-  - Pinned dirs are listed at any depth to the chain ends, and their files with a future mtime or ctime are recorded. Each chain end is classified as culprit, stale or undetermined.
+  - Pinned dirs are listed at any depth to the chain ends, and their files with a future mtime or ctime are recorded. Each chain end is classified as culprit, stale or undetermined. A pinned dir that couldn't be listed (a limit, an error) is an undetermined end, never left out.
+  - Dirs with more than `--max-list-entries` entries are not listed; they are counted, warned about, and make the exit status 3.
   - `--largest N` then visits N more dirs per root, best-first.
   - All limits apply per root.
 - **`plan`** writes nothing. It shows each tracked dir with the governing rule and the reason (depth, budget rank, transit, excluded). Approximate values, such as the `rctime_effective` of a pinned dir, are marked `~` and explained once in a footnote.

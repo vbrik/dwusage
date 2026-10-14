@@ -11,6 +11,7 @@ import errno
 import gzip
 import json
 import os
+import stat
 import sys
 import tempfile
 from collections.abc import Iterable, Iterator
@@ -82,6 +83,7 @@ def capture_lines(
         "truncated_roots": result.truncated_roots,
         "chain_truncated_roots": result.chain_truncated_roots,
         "chain_ends": result.chain_ends,
+        "oversized": result.oversized,
     }
 
 
@@ -93,7 +95,8 @@ def _dumps(line: dict) -> str:
 class Output:
     """Where a capture goes: a file, or stdout for "-".
 
-    Create it before capturing, so a bad destination fails before the work starts. A file is
+    Create it before capturing, so a bad destination fails before the work starts: an empty
+    path, a directory, or an existing entry that isn't a regular file. A file is
     written to a hidden temporary file (mode 0600, as captures reveal names and sizes of
     private directories) next to the destination and renamed into place by `write`. Leaving
     the context without a successful `write` removes the temporary file.
@@ -105,8 +108,14 @@ class Output:
         self._fd: int | None = None
         if path == "-":
             return
+        if not path:
+            raise OSError(errno.EINVAL, "empty output path", path)
         if os.path.isdir(path) or path.endswith("/"):
             raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), path)
+        with suppress(FileNotFoundError):
+            # Renaming over a device (run as root: /dev/null) or a symlink would replace it.
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                raise OSError(errno.EEXIST, "exists and is not a regular file; use -o -", path)
         directory, name = os.path.split(os.path.abspath(path))
         # mkstemp uses O_EXCL and mode 0600; writing through its fd never follows a symlink.
         self._fd, self._tmp = tempfile.mkstemp(dir=directory, prefix=f".{name}.", suffix=".tmp")

@@ -66,10 +66,11 @@ def test_bad_root_is_an_error(fake, tmp_path, capsys):
     assert list(tmp_path.iterdir()) == []
 
 
-@pytest.mark.parametrize("output", ["no/c.jsonl", "", "dir/"])
-def test_bad_output_fails_before_capturing(fake, tmp_path, capsys, output):
+@pytest.mark.parametrize("output", ["{tmp}/no/c.jsonl", "{tmp}/dir", "{tmp}/dir/", ""])
+def test_bad_output_fails_before_capturing(fake, tmp_path, monkeypatch, capsys, output):
     (tmp_path / "dir").mkdir()
-    assert cli.main(["capture", "/r", "-o", str(tmp_path / output)]) == 1
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["capture", "/r", "-o", output.format(tmp=tmp_path)]) == 1
     assert squash(capsys.readouterr().err).startswith("ERROR: cannot write")
     assert fake.listed == []
 
@@ -119,3 +120,26 @@ def test_summary_warns_without_openat2():
     fs.mkdir("/r")
     lines = cli.capture_summary(capture(fs, ["/r"]), n_roots=1, output="-", openat2=False)
     assert any(line.startswith("WARNING: openat2 is unavailable") for line in lines)
+
+
+def test_names_in_messages_cannot_inject_terminal_escapes(monkeypatch, capsys):
+    fs = FakeFs()
+    fs.mkdir("/r", rctime=PINNED)
+    fs.mkfile("/r/evil\x1b[2J\nERROR: forged", mtime=PINNED)
+    use(monkeypatch, fs)
+    assert cli.main(["capture", "/r", "--depth", "0", "-o", "-"]) == 0
+    err = capsys.readouterr().err
+    assert "\x1b" not in err and "\nERROR: forged" not in err
+    assert "/r/evil\\x1b[2J\\x0aERROR: forged" in err
+
+
+def test_dirs_too_big_to_list_warn_and_exit_3(monkeypatch, capsys):
+    fs = FakeFs()
+    fs.mkdir("/r/big/sub")
+    for i in range(3):
+        fs.mkfile(f"/r/big/f{i}")
+    use(monkeypatch, fs)
+    argv = ["capture", "/r", "--depth", "3", "--max-list-entries", "3", "-o", "-"]
+    assert cli.main(argv) == 3
+    err = squash(capsys.readouterr().err)
+    assert "WARNING: --max-list-entries kept 1 dir under /r from being listed;" in err

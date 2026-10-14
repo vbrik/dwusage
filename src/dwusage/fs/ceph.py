@@ -89,7 +89,7 @@ class CephFs:
                     elif len(nondirs) < stat_nondirs:
                         with suppress(FileNotFoundError):  # removed since readdir
                             nondirs.append((entry.name, syscalls.stat_at(fd, entry.name)))
-                    elif stat_nondirs:
+                    else:
                         truncated = True
             return Listing(subdirs, nondirs, truncated)
         finally:
@@ -105,15 +105,12 @@ class CephFs:
         flags |= os.O_DIRECTORY | os.O_CLOEXEC
         try:
             if self.openat2:
-                try:
-                    return syscalls.openat2(anchor_fd, relative, flags, _RESOLVE)
-                except OSError as exc:
-                    if exc.errno not in (errno.ENOSYS, errno.EPERM):
-                        raise
-                    self.openat2 = False
+                return syscalls.openat2(anchor_fd, relative, flags, _RESOLVE)
             fd = os.open(relative, flags | os.O_NOFOLLOW, dir_fd=anchor_fd)
         except OSError as exc:
-            if exc.errno == errno.ELOOP:
+            if exc.errno == errno.ELOOP or (
+                exc.errno == errno.ENOTDIR and self._is_link(anchor_fd, relative)
+            ):
                 raise symlink_error(path) from None
             if exc.errno == errno.EXDEV:
                 raise mount_error(path) from None
@@ -130,5 +127,30 @@ class CephFs:
                 if stat.S_ISLNK(os.lstat(root).st_mode):
                     raise OSError(errno.ELOOP, "is a symlink; give its target instead", root)
                 fd = os.open(root, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                if self.openat2 and not self._openat2_works(fd):
+                    self.openat2 = False
                 self._anchors[root] = (fd, os.fstat(fd).st_dev)
             return self._anchors[root]
+
+    @staticmethod
+    def _openat2_works(anchor_fd: int) -> bool:
+        """Return False if the kernel or a seccomp filter rejects openat2 itself.
+
+        Probing the root, before any user-controlled path, keeps an error on some directory
+        from ever switching the walk to the weaker fallback.
+        """
+        try:
+            os.close(syscalls.openat2(anchor_fd, ".", os.O_PATH | os.O_DIRECTORY, _RESOLVE))
+        except OSError as exc:
+            if exc.errno in (errno.ENOSYS, errno.EPERM):
+                return False
+            raise
+        return True
+
+    @staticmethod
+    def _is_link(anchor_fd: int, relative: str) -> bool:
+        """Return True if `relative` is a symlink (O_DIRECTORY reports one as ENOTDIR)."""
+        try:
+            return stat.S_ISLNK(os.stat(relative, dir_fd=anchor_fd, follow_symlinks=False).st_mode)
+        except OSError:
+            return False

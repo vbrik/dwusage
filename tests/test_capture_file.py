@@ -1,4 +1,6 @@
+import errno
 import json
+import os
 import stat
 
 import pytest
@@ -45,6 +47,7 @@ def test_record_layout():
         "truncated_roots": (),
         "chain_truncated_roots": (),
         "chain_ends": {"/r": "culprit"},
+        "oversized": {},
     }
 
 
@@ -111,3 +114,32 @@ def test_read_jsonl_reports_bad_line(tmp_path):
     path.write_text('{"type":"capture_start"}\nnot json\n')
     with pytest.raises(json.JSONDecodeError):
         list(read_jsonl(str(path)))
+
+
+def test_existing_non_regular_destination_is_refused(tmp_path):
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "elsewhere")
+    for path in (fifo, link):
+        with pytest.raises(OSError, match="not a regular file"):
+            Output(str(path))
+    assert stat.S_ISFIFO(fifo.lstat().st_mode) and link.is_symlink()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["fifo", "link"]
+
+
+def test_existing_regular_file_is_replaced(tmp_path):
+    out = tmp_path / "cap.jsonl"
+    out.write_text("old\n")
+    with Output(str(out)) as output:
+        output.write([{"type": "x"}])
+    assert out.read_text() == '{"type":"x"}\n'
+
+
+def test_empty_destination_is_refused(tmp_path, monkeypatch):
+    (tmp_path / "cwd").mkdir()
+    monkeypatch.chdir(tmp_path / "cwd")
+    with pytest.raises(OSError) as exc:
+        Output("")
+    assert exc.value.errno == errno.EINVAL
+    assert [p.name for p in tmp_path.iterdir()] == ["cwd"]

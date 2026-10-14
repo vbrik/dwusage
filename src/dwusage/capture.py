@@ -63,7 +63,7 @@ class ChainEnd(StrEnum):
 
     CULPRIT = "culprit"  # the dir or one of its entries has a future mtime or ctime
     STALE = "stale"  # nothing visible is in the future: that entry was changed or removed
-    UNDETERMINED = "undetermined"  # an unreadable or vanished subdir, or a truncated scan
+    UNDETERMINED = "undetermined"  # not listed, a subdir unreadable or gone, or scan cut short
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +139,13 @@ class CaptureResult:
     truncated_roots: tuple[str, ...]  # max_dirs reached: deeper dirs are missing
     chain_truncated_roots: tuple[str, ...]  # chain_max_dirs reached: chains not followed
     chain_ends: dict[str, ChainEnd]  # pinned dirs with no pinned subdir, by path
+
+    @property
+    def oversized(self) -> dict[str, int]:
+        """Return, per root, the number of dirs not listed for exceeding max_list_entries."""
+        return dict(
+            Counter(r.root for r in self.records.values() if r.skipped == "max_list_entries")
+        )
 
     @property
     def n_errors(self) -> int:
@@ -353,7 +360,10 @@ class Capturer:
         """Classify each listed pinned dir that has no pinned subdir."""
         ends = {}
         for path, rec in records.items():
-            if rec.subdirs is None or not self._is_pinned(rec):
+            if not self._is_pinned(rec):
+                continue
+            if rec.subdirs is None:  # skipped by a limit or failed to list: can't look below
+                ends[path] = ChainEnd.UNDETERMINED
                 continue
             children = [records.get(os.path.join(path, name)) for name in rec.subdirs]
             if any(child is not None and self._is_pinned(child) for child in children):
