@@ -1,9 +1,13 @@
 """Capture raw CephFS state for offline replay and diagnostics.
 
 A capture walks breadth-first from each root. Every directory reached is *visited*: its
-stat and all CephFS xattrs are recorded as raw values. Directories fewer than ``depth``
-levels below their root are also *listed*: their subdirectory names are recorded and those
-subdirectories visited.
+stat and all CephFS xattrs are recorded as raw values. Some are also *listed*: their
+subdirectory names are recorded and those subdirectories visited. A directory is listed when
+
+- it is fewer than ``depth`` levels below its root (reason ``depth``);
+- its rctime is pinned in the future, at any depth (reason ``chain``). The chain of pinned
+  dirs is followed down to its ends, and the non-directory entries of every pinned dir are
+  stat-ed to record those with a future mtime or ctime, which pin rctime.
 
 Limits apply per root, so one big root can't starve the others. Per-directory failures are
 recorded in `DirRecord.errors` and never stop the capture.
@@ -24,12 +28,19 @@ from typing import Final, NamedTuple
 from dwusage import xattrs
 from dwusage.fs.base import RawFs, RawStat, describe_oserror
 from dwusage.paths import is_below, path_key
+from dwusage.rctime import FUTURE_SLACK_S, is_future
 
 MAX_DIRS: Final = 100_000
 """Default visited dirs per root: roughly 150 MB of memory and a minute or two on CephFS."""
 
 MAX_LIST_ENTRIES: Final = 1_000_000
 """Default limit on entries of a dir to list: readdir cost grows with all entries, files too."""
+
+CHAIN_MAX_DIRS: Final = 10_000
+"""Default dirs per root visited only to follow pinned rctimes; chains are short and few."""
+
+PINNED_MAX_FILES: Final = 100_000
+"""Default non-directory entries stat-ed per pinned dir to find what pins its rctime."""
 
 _BATCH: Final = 1024
 """Tasks handed to the pool at a time, so a huge level doesn't create all futures at once."""
@@ -40,6 +51,15 @@ class Reason(StrEnum):
 
     ROOT = "root"
     DEPTH = "depth"
+    CHAIN = "chain"
+
+
+class ChainEnd(StrEnum):
+    """What a pinned dir at the bottom of a chain shows."""
+
+    CULPRIT = "culprit"  # the dir or one of its entries has a future mtime or ctime
+    STALE = "stale"  # nothing visible is in the future: that entry was changed or removed
+    UNDETERMINED = "undetermined"  # an unreadable or vanished subdir, or a truncated scan
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +69,26 @@ class CaptureLimits:
     depth: int = 2
     max_dirs: int = MAX_DIRS  # visited dirs per root
     max_list_entries: int = MAX_LIST_ENTRIES
+    chain_max_dirs: int = CHAIN_MAX_DIRS  # per root
+    pinned_max_files: int = PINNED_MAX_FILES
+    future_slack_s: float = FUTURE_SLACK_S
+
+
+@dataclass(frozen=True, slots=True)
+class FutureEntry:
+    """An entry of a pinned dir with a future mtime or ctime; "." is the dir itself."""
+
+    name: str
+    stat: RawStat
+
+
+@dataclass(frozen=True, slots=True)
+class FileScan:
+    """The stat-ed non-directory entries of a pinned dir."""
+
+    scanned: int
+    truncated: bool  # stopped at CaptureLimits.pinned_max_files
+    future: tuple[FutureEntry, ...]  # sorted by name
 
 
 @dataclass(slots=True)
@@ -64,6 +104,7 @@ class DirRecord:
     xattrs: dict[str, str] = field(default_factory=dict)
     subdirs: list[str] | None = None  # sorted names; None unless listed
     skipped: str | None = None  # name of the limit that prevented listing
+    files: FileScan | None = None  # pinned, listed dirs only
     errors: dict[str, str] = field(default_factory=dict)  # step -> description
 
     def xattr_int(self, name: str) -> int | None:
@@ -71,6 +112,14 @@ class DirRecord:
         value = self.xattrs.get(name)
         try:
             return None if value is None else int(value)
+        except ValueError:
+            return None
+
+    def rctime(self) -> float | None:
+        """Return ceph.dir.rctime in seconds, or None if it is absent or malformed."""
+        value = self.xattrs.get("ceph.dir.rctime")
+        try:
+            return None if value is None else xattrs.parse_time(value)
         except ValueError:
             return None
 
@@ -83,6 +132,8 @@ class CaptureResult:
     started_at: float
     elapsed_s: float
     truncated_roots: tuple[str, ...]  # max_dirs reached: deeper dirs are missing
+    chain_truncated_roots: tuple[str, ...]  # chain_max_dirs reached: chains not followed
+    chain_ends: dict[str, ChainEnd]  # pinned dirs with no pinned subdir, by path
 
     @property
     def n_errors(self) -> int:
@@ -115,7 +166,9 @@ class Capturer:
         self._now = now
         self._records: dict[str, DirRecord] = {}
         self._visited: Counter[str] = Counter()
+        self._chain_dirs: Counter[str] = Counter()
         self._truncated: set[str] = set()
+        self._chain_truncated: set[str] = set()
 
     def run(self, roots: list[str]) -> CaptureResult:
         """Capture the trees under `roots`, which must pass `check_roots`."""
@@ -131,6 +184,8 @@ class Capturer:
             started_at=started_at,
             elapsed_s=time.monotonic() - start,
             truncated_roots=tuple(sorted(self._truncated)),
+            chain_truncated_roots=tuple(sorted(self._chain_truncated)),
+            chain_ends=self._chain_ends(records),
         )
 
     def _map[T, R](self, fn: Callable[[T], R], items: Iterable[T]) -> list[R]:
@@ -168,42 +223,101 @@ class Capturer:
         if found.xattr_failure is not None:
             name, exc = found.xattr_failure
             rec.errors["xattr"] = f"{name}: {describe_oserror(exc)}"
+        if "ceph.dir.rctime" in rec.xattrs and rec.rctime() is None:
+            rec.errors["rctime"] = f"malformed: {rec.xattrs['ceph.dir.rctime']!r}"
         return rec
 
+    def _is_future(self, st: RawStat, now: float) -> bool:
+        """Return True if the newer of `st`'s mtime and ctime is implausibly after `now`."""
+        newest = max(st.mtime_ns, st.ctime_ns) / 1e9
+        return is_future(newest, now, self._limits.future_slack_s)
+
+    def _is_pinned(self, rec: DirRecord) -> bool:
+        """Return True if `rec`'s rctime is in the future."""
+        rctime = rec.rctime()
+        return rctime is not None and is_future(
+            rctime, rec.captured_at, self._limits.future_slack_s
+        )
+
     def _choose_listed(self, visited: list[DirRecord]) -> list[DirRecord]:
-        """Return the dirs among `visited` to list."""
+        """Return the dirs among `visited` to list, charging chain dirs in path order."""
         chosen = []
         for rec in visited:
             if rec.root in self._truncated or "stat" in rec.errors or "xattr" in rec.errors:
                 continue
-            if rec.depth >= self._limits.depth:
+            within_depth = rec.depth < self._limits.depth
+            if not within_depth and not self._is_pinned(rec):
                 continue
             entries = rec.xattr_int("ceph.dir.entries") or 0
             if entries > self._limits.max_list_entries:
                 rec.skipped = "max_list_entries"
                 continue
+            if not within_depth:
+                n_subdirs = rec.xattr_int("ceph.dir.subdirs") or 0
+                if self._chain_dirs[rec.root] + n_subdirs > self._limits.chain_max_dirs:
+                    rec.skipped = "chain_max_dirs"
+                    self._chain_truncated.add(rec.root)
+                    continue
+                self._chain_dirs[rec.root] += n_subdirs
             chosen.append(rec)
         return chosen
 
     def _list(self, rec: DirRecord) -> None:
-        """Record `rec`'s subdirs."""
-        if rec.xattr_int("ceph.dir.subdirs") == 0:
+        """Record `rec`'s subdirs; for a pinned dir, also its entries with future times."""
+        pinned = self._is_pinned(rec)
+        if not pinned and rec.xattr_int("ceph.dir.subdirs") == 0:
             rec.subdirs = []
             return
         try:
-            listing = self._fs.listdir(rec.path)
+            listing = self._fs.listdir(rec.path, self._limits.pinned_max_files if pinned else 0)
         except OSError as exc:
             rec.errors["list"] = describe_oserror(exc)
             return
         rec.subdirs = sorted(listing.subdirs)
+        if pinned:
+            future = [
+                FutureEntry(name, st)
+                for name, st in listing.nondirs
+                if self._is_future(st, rec.captured_at)
+            ]
+            if rec.stat is not None and self._is_future(rec.stat, rec.captured_at):
+                future.append(FutureEntry(".", rec.stat))
+            future.sort(key=attrgetter("name"))
+            rec.files = FileScan(len(listing.nondirs), listing.nondirs_truncated, tuple(future))
 
     def _children(self, listed: list[DirRecord]) -> list[_Pending]:
         """Return the subdirs of the `listed` dirs, to visit next."""
         return [
-            _Pending(os.path.join(rec.path, name), rec.root, rec.depth + 1, Reason.DEPTH)
+            _Pending(
+                os.path.join(rec.path, name),
+                rec.root,
+                rec.depth + 1,
+                Reason.DEPTH if rec.depth < self._limits.depth else Reason.CHAIN,
+            )
             for rec in listed
             for name in rec.subdirs or ()
         ]
+
+    def _chain_ends(self, records: dict[str, DirRecord]) -> dict[str, ChainEnd]:
+        """Classify each listed pinned dir that has no pinned subdir."""
+        ends = {}
+        for path, rec in records.items():
+            if rec.subdirs is None or not self._is_pinned(rec):
+                continue
+            children = [records.get(os.path.join(path, name)) for name in rec.subdirs]
+            if any(child is not None and self._is_pinned(child) for child in children):
+                continue  # the chain goes on below
+            if rec.files is not None and rec.files.future:
+                ends[path] = ChainEnd.CULPRIT
+            elif (
+                rec.files is None
+                or rec.files.truncated
+                or any(child is None or child.errors for child in children)
+            ):
+                ends[path] = ChainEnd.UNDETERMINED
+            else:
+                ends[path] = ChainEnd.STALE
+        return ends
 
 
 def check_roots(fs: RawFs, roots: list[str]) -> list[str]:
