@@ -7,7 +7,9 @@ subdirectory names are recorded and those subdirectories visited. A directory is
 - it is fewer than ``depth`` levels below its root (reason ``depth``);
 - its rctime is pinned in the future, at any depth (reason ``chain``). The chain of pinned
   dirs is followed down to its ends, and the non-directory entries of every pinned dir are
-  stat-ed to record those with a future mtime or ctime, which pin rctime.
+  stat-ed to record those with a future mtime or ctime, which pin rctime;
+- after the walk, it is among the biggest (rbytes) unlisted dirs of its root, until
+  ``largest`` more dirs have been visited (reason ``largest``).
 
 Limits apply per root, so one big root can't starve the others. Per-directory failures are
 recorded in `DirRecord.errors` and never stop the capture.
@@ -26,6 +28,7 @@ from operator import attrgetter
 from typing import Final, NamedTuple
 
 from dwusage import xattrs
+from dwusage.bestfirst import best_first
 from dwusage.fs.base import RawFs, RawStat, describe_oserror
 from dwusage.paths import is_below, path_key
 from dwusage.rctime import FUTURE_SLACK_S, is_future
@@ -52,6 +55,7 @@ class Reason(StrEnum):
     ROOT = "root"
     DEPTH = "depth"
     CHAIN = "chain"
+    LARGEST = "largest"
 
 
 class ChainEnd(StrEnum):
@@ -67,6 +71,7 @@ class CaptureLimits:
     """Bounds of one capture; see the module docstring for what each expansion does."""
 
     depth: int = 2
+    largest: int = 0  # extra dirs visited per root, biggest first
     max_dirs: int = MAX_DIRS  # visited dirs per root
     max_list_entries: int = MAX_LIST_ENTRIES
     chain_max_dirs: int = CHAIN_MAX_DIRS  # per root
@@ -178,6 +183,8 @@ class Capturer:
             listed = self._choose_listed(self._visit_all(pending))
             self._map(self._list, listed)
             pending = self._children(listed)
+        for root in sorted(roots):
+            self._expand_largest(root)
         records = dict(sorted(self._records.items(), key=lambda item: path_key(item[0])))
         return CaptureResult(
             records=records,
@@ -297,6 +304,50 @@ class Capturer:
             for rec in listed
             for name in rec.subdirs or ()
         ]
+
+    def _expandable(self, rec: DirRecord) -> bool:
+        """Return True if `rec` can be listed by `_expand_largest`."""
+        n_subdirs = rec.xattr_int("ceph.dir.subdirs") or 0
+        entries = rec.xattr_int("ceph.dir.entries") or 0
+        return (
+            rec.subdirs is None
+            and not rec.errors
+            and rec.skipped is None
+            and rec.xattr_int("ceph.dir.rbytes") is not None
+            and n_subdirs > 0
+            and entries <= self._limits.max_list_entries
+        )
+
+    def _expand_largest(self, root: str) -> None:
+        """Visit up to `largest` more dirs under `root`, listing the biggest dirs first."""
+        remaining = min(self._limits.largest, self._limits.max_dirs - self._visited[root])
+        if remaining <= 0 or root in self._truncated:
+            return
+
+        def expand(rec: DirRecord) -> list[DirRecord]:
+            nonlocal remaining
+            if (rec.xattr_int("ceph.dir.subdirs") or 0) > remaining:
+                return []  # doesn't fit; smaller dirs may
+            self._list(rec)
+            children = [
+                _Pending(os.path.join(rec.path, name), root, rec.depth + 1, Reason.LARGEST)
+                for name in rec.subdirs or ()
+            ]
+            visited = self._visit_all(children)
+            remaining -= len(visited)
+            return [child for child in visited if self._expandable(child)]
+
+        start = [
+            rec for rec in self._records.values() if rec.root == root and self._expandable(rec)
+        ]
+        for _ in best_first(
+            start,
+            weight=lambda rec: rec.xattr_int("ceph.dir.rbytes") or 0,
+            key=lambda rec: path_key(rec.path),
+            expand=expand,
+        ):
+            if remaining <= 0 or root in self._truncated:
+                break
 
     def _chain_ends(self, records: dict[str, DirRecord]) -> dict[str, ChainEnd]:
         """Classify each listed pinned dir that has no pinned subdir."""
