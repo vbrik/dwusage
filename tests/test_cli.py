@@ -143,3 +143,21 @@ def test_dirs_too_big_to_list_warn_and_exit_3(monkeypatch, capsys):
     assert cli.main(argv) == 3
     err = squash(capsys.readouterr().err)
     assert "WARNING: --max-list-entries kept 1 dir under /r from being listed;" in err
+
+
+@pytest.mark.parametrize(("euid", "status"), [(0, 1), (1000, 0)])
+def test_without_openat2_root_refuses_and_others_are_warned(
+    monkeypatch, tmp_path, capsys, euid, status
+):
+    fs = FakeFs()
+    fs.mkdir("/r/a")
+    fs.openat2 = False  # as CephFs reports after probing a kernel without openat2
+    use(monkeypatch, fs)
+    monkeypatch.setattr(cli.os, "geteuid", lambda: euid)
+    assert cli.main(["capture", "/r", "-o", str(tmp_path / "c.jsonl")]) == status
+    err = squash(capsys.readouterr().err)
+    if euid == 0:
+        assert err.startswith("ERROR: openat2 is unavailable")
+        assert fs.listed == [] and list(tmp_path.iterdir()) == []
+    else:
+        assert "WARNING: openat2 is unavailable" in err

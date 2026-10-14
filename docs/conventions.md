@@ -5,7 +5,8 @@
 - `CephFs` opens every directory below its root with openat2(2) and never follows a symlink
   or enters another mount: the tool runs as root over user-writable trees. All reads use the
   resulting file descriptor. Whether openat2 works is decided once per root, before any
-  user-controlled path; without it `CephFs` falls back (weaker) and the CLI warns.
+  user-controlled path; without it `CephFs` falls back (weaker): the CLI refuses to run as
+  root and warns otherwise.
 - Names from the filesystem go through `paths.printable` before they appear in messages, so
   they can't control the terminal or forge lines.
 - Read CephFS stats with getxattr only. What `read()` and `st_size` return for directories

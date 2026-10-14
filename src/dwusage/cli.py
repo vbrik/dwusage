@@ -27,6 +27,12 @@ EXIT_INCOMPLETE: Final = 3
 
 EXIT_INTERRUPTED: Final = 130
 
+ROOT_WITHOUT_OPENAT2: Final = (
+    "openat2 is unavailable (Linux < 5.6 or a seccomp filter); refusing to run as root, where "
+    "a directory swapped for a symlink could redirect reads. Use a newer kernel, or run as a "
+    "non-root user (unreadable dirs are then recorded as errors)."
+)
+
 CAPTURE_DESCRIPTION: Final = """\
 Record the stat, CephFS xattrs and subdirectory names of directories under each ROOT, for
 replay and diagnostics without access to the filesystem. Read-only except for OUTPUT.
@@ -40,6 +46,8 @@ Output is JSON Lines (capture_start, one "dir" record per directory, capture_end
 because it reveals names and sizes of private directories. Example:
   zcat cap.jsonl.gz | jq -r 'select(.type=="dir" and .errors!={}) | .path'
 A summary goes to stderr. Unreadable dirs are recorded in .errors and don't fail the run.
+As root it refuses to run without openat2 (Linux 5.6 or later), which keeps symlinks swapped
+in during the walk from redirecting reads.
 Exit status: 0 done, 1 error, 2 usage error, 3 a limit left work undone, 130 interrupted.
 """
 
@@ -205,6 +213,8 @@ def run_capture(args: argparse.Namespace) -> int:
     with ExitStack() as cleanup:
         fs = cleanup.enter_context(CephFs(roots))
         problems = check_roots(fs, roots)
+        if not problems and not fs.openat2 and os.geteuid() == 0:  # check_roots probed it
+            problems.append(ROOT_WITHOUT_OPENAT2)
         try:
             output = cleanup.enter_context(Output(args.output))
         except OSError as exc:
