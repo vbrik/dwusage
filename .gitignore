@@ -1,0 +1,11 @@
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+# Captures hold names from live filesystems; never commit them (or their temporary files).
+*.jsonl
+*.jsonl.gz
+*.tmp
